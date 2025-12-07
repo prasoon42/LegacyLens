@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BioNexus Reader - Medical OCR</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, #00f5a0 0%, #00d9f5 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle { color: #8b92a8; margin-bottom: 30px; }
+        .upload-zone {
+            border: 3px dashed #00f5a0;
+            border-radius: 20px;
+            padding: 60px;
+            text-align: center;
+            background: rgba(0, 245, 160, 0.05);
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 30px;
+        }
+        .upload-zone:hover { background: rgba(0, 245, 160, 0.1); transform: scale(1.02); }
+        .upload-zone.dragover { background: rgba(0, 245, 160, 0.2); border-color: #00d9f5; }
+        input[type="file"] { display: none; }
+        .btn {
+            background: linear-gradient(135deg, #00f5a0 0%, #00d9f5 100%);
+            color: #1a1a2e;
+            padding: 15px 40px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .btn:hover { transform: scale(1.05); }
+        .results {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 30px;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .metric {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 15px;
+        }
+        .metric-label { color: #8b92a8; font-size: 0.9rem; margin-bottom: 5px; }
+        .metric-value {
+            font-size: 3rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #00f5a0 0%, #00d9f5 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .sys { color: #00f5a0; }
+        .dia { color: #00d9f5; }
+        .pulse { color: #ff006e; }
+        img { max-width: 100%; border-radius: 10px; margin-top: 15px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        th { color: #00f5a0; font-weight: 600; }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+        }
+        .spinner {
+            border: 4px solid rgba(0, 245, 160, 0.1);
+            border-top: 4px solid #00f5a0;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .error {
+            background: rgba(255, 0, 110, 0.1);
+            border: 1px solid #ff006e;
+            color: #ff006e;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🧬 BioNexus Reader</h1>
+        <p class="subtitle">Advanced Medical OCR Engine - Powered by PaddleOCR</p>
+        
+        <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+            <h2>📤 Drop Image Here or Click to Upload</h2>
+            <p style="color: #8b92a8; margin-top: 10px;">Supports JPG, JPEG, PNG (Max 200MB)</p>
+            <input type="file" id="fileInput" accept="image/*" onchange="uploadImage()">
+        </div>
+        
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>Analyzing image...</p>
+        </div>
+        
+        <div class="error" id="error"></div>
+        
+        <div class="results" id="results" style="display: none;">
+            <div class="card">
+                <h2>📊 Digital Readout</h2>
+                <div class="metric">
+                    <div class="metric-label">SYSTOLIC</div>
+                    <div class="metric-value sys" id="sysValue">--</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">DIASTOLIC</div>
+                    <div class="metric-value dia" id="diaValue">--</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">PULSE RATE</div>
+                    <div class="metric-value pulse" id="pulseValue">--</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🔍 Detection Overlay</h2>
+                <img id="visImage" src="" alt="Visualization">
+            </div>
+            
+            <div class="card">
+                <h2>🖼️ OCR Input (Debug)</h2>
+                <img id="debugImage" src="" alt="Debug">
+            </div>
+            
+            <div class="card">
+                <h2>📜 Recent Readings</h2>
+                <table id="historyTable">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>SYS</th>
+                            <th>DIA</th>
+                            <th>PULSE</th>
+                        </tr>
+                    </thead>
+                    <tbody id="historyBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        
+        // Drag and drop
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+        
+        uploadZone.addEventListener('dragleave', () => {
+            uploadZone.classList.remove('dragover');
+        });
+        
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                fileInput.files = files;
+                uploadImage();
+            }
+        });
+        
+        async function uploadImage() {
+            const file = fileInput.files[0];
+            if (!file) return;
+            
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+            document.getElementById('error').style.display = 'none';
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                
+                // Update metrics
+                document.getElementById('sysValue').textContent = data.metrics.SYS || '--';
+                document.getElementById('diaValue').textContent = data.metrics.DIA || '--';
+                document.getElementById('pulseValue').textContent = data.metrics.PULSE || '--';
+                
+                // Update images
+                document.getElementById('visImage').src = 'data:image/jpeg;base64,' + data.visualization;
+                document.getElementById('debugImage').src = 'data:image/jpeg;base64,' + data.debug;
+                
+                // Update history
+                const tbody = document.getElementById('historyBody');
+                tbody.innerHTML = '';
+                data.history.forEach(reading => {
+                    const row = tbody.insertRow();
+                    row.innerHTML = `
+                        <td>${reading.timestamp}</td>
+                        <td>${reading.sys}</td>
+                        <td>${reading.dia}</td>
+                        <td>${reading.pulse}</td>
+                    `;
+                });
+                
+                document.getElementById('results').style.display = 'grid';
+            } catch (error) {
+                document.getElementById('error').textContent = 'Error: ' + error.message;
+                document.getElementById('error').style.display = 'block';
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>

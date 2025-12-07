@@ -1,0 +1,9 @@
+streamlit
+numpy
+opencv-python-headless
+Pillow
+easyocr
+# inference-sdk>=0.9.15  # Commented out due to Python 3.13 incompatibility
+paddlepaddle
+paddleocr
+ultralytics
