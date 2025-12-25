@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
-"""Flask-based OCR web application - no caching issues!"""
+"""Generic 7-Segment OCR Web App"""
 from flask import Flask, render_template, request, jsonify
 import cv2
 import numpy as np
 import base64
-from datetime import datetime
 import os
 import sys
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.detect_and_ocr import preprocess_image, detect_digits, map_rows_to_metrics, visualize
+from src.detect_and_ocr import detect_text, preprocess_image, visualize
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max
-
-# Store readings in memory (in production, use a database)
-readings_history = []
 
 @app.route('/')
 def index():
@@ -41,38 +37,23 @@ def analyze():
         if img is None:
             return jsonify({'error': 'Invalid image file'}), 400
         
-        # Process image
+        # Preprocess first (consistent with backend)
         img = preprocess_image(img)
-        boxes = detect_digits(img)
-        metrics, debug_img = map_rows_to_metrics(img, boxes)
         
-        # Create visualization
-        vis_img = visualize(img, boxes, metrics)
+        # Detect
+        items = detect_text(img)
         
-        # Convert images to base64 for web display
+        # Visualize
+        vis_img = visualize(img, items)
+        
+        # Convert to base64
         _, buffer = cv2.imencode('.jpg', vis_img)
         vis_b64 = base64.b64encode(buffer).decode('utf-8')
         
-        _, debug_buffer = cv2.imencode('.jpg', debug_img)
-        debug_b64 = base64.b64encode(debug_buffer).decode('utf-8')
-        
-        # Store in history
-        reading = {
-            'timestamp': datetime.now().strftime('%H:%M'),
-            'sys': metrics.get('SYS', '--'),
-            'dia': metrics.get('DIA', '--'),
-            'pulse': metrics.get('PULSE', '--')
-        }
-        readings_history.insert(0, reading)
-        if len(readings_history) > 10:
-            readings_history.pop()
-        
         return jsonify({
             'success': True,
-            'metrics': metrics,
-            'visualization': vis_b64,
-            'debug': debug_b64,
-            'history': readings_history
+            'items': items,
+            'visualization': vis_b64
         })
     
     except Exception as e:
@@ -80,10 +61,6 @@ def analyze():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
-
-@app.route('/history')
-def get_history():
-    return jsonify({'history': readings_history})
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

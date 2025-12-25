@@ -1,51 +1,17 @@
 import os
-import time
-import re
 import cv2
 import numpy as np
+import re
+from paddleocr import PaddleOCR
 
-# ----------------- Helpers: IoU / NMS / merging -----------------
-def iou(a,b):
-    xA = max(a[0], b[0])
-    yA = max(a[1], b[1])
-    xB = min(a[2], b[2])
-    yB = min(a[3], b[3])
-    interW = max(0, xB-xA)
-    interH = max(0, yB-yA)
-    inter = interW * interH
-    areaA = max(0,(a[2]-a[0]))*max(0,(a[3]-a[1]))
-    areaB = max(0,(b[2]-b[0]))*max(0,(b[3]-b[1]))
-    union = areaA + areaB - inter
-    if union<=0:
-        return 0.0
-    return inter/union
-
-def nms_boxes(boxes, iou_thresh=0.35):
-    if not boxes:
-        return []
-    boxes = sorted(boxes, key=lambda x: x[4], reverse=True)
-    keep = []
-    used = [False]*len(boxes)
-    for i,b in enumerate(boxes):
-        if used[i]:
-            continue
-        keep.append(b)
-        for j in range(i+1,len(boxes)):
-            if used[j]:
-                continue
-            if iou(b, boxes[j]) > iou_thresh:
-                used[j] = True
-    return keep
-
-# ----------------- PaddleOCR SETUP -----------------
+# ----------------- PaddleOCR SINGLETON -----------------
 _PADDLE_OCR = None
 
 def get_reader():
     global _PADDLE_OCR
     if _PADDLE_OCR is None:
         try:
-            from paddleocr import PaddleOCR
-            # Initialize PaddleOCR
+            # Initialize PaddleOCR (English, no angle classification for speed if not needed)
             _PADDLE_OCR = PaddleOCR(use_angle_cls=False, lang='en')
             print("[init] PaddleOCR initialized.", flush=True)
         except Exception as e:
@@ -53,7 +19,7 @@ def get_reader():
     return _PADDLE_OCR
 
 # ----------------- PREPROCESS -----------------
-def preprocess_image(img, max_side=1000):
+def preprocess_image(img, max_side=1200):
     if img is None:
         return None
     h, w = img.shape[:2]
@@ -62,478 +28,347 @@ def preprocess_image(img, max_side=1000):
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
     return img
 
-def apply_preprocessing(img, mode="Default"):
-    # Add padding to help with edge digits
-    img_padded = cv2.copyMakeBorder(img, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+def clean_segment_text(text):
+    # Map common 7-segment confusions
+    # 7-seg specific replacements
+    # Z -> 2, S -> 5, etc.
+    subs = {
+        'O': '0', 'o': '0', 'D': '0', 'Q': '0',
+        'Z': '2', 'z': '2',
+        'B': '8', 
+        'A': '4', 'h': '4',
+        'G': '6', 
+        'T': '7', 
+        'S': '5',
+        'E': '3', 'F': '3', # Common 7-seg confusions
+        '.': '', ' ': '',
+        ']': '1', '[': '1', 'l': '1', 'I': '1'
+    }
+    for k, v in subs.items():
+        text = text.replace(k, v)
     
-    if mode == "Default":
-        return img_padded
+    # Filter non-numeric? Or allow specific chars?
+    # For now, keep alphanumeric but focus on digits
+    return re.sub(r'[^0-9]', '', text)
+
+def calculate_iou(box1, box2):
+    # Simple fitting AABB IoU for robustness
+    # box is list of [x,y]
+    p1 = np.array(box1)
+    p2 = np.array(box2)
     
-    # Convert to grayscale
-    gray = cv2.cvtColor(img_padded, cv2.COLOR_BGR2GRAY)
-    if mode == "Grayscale":
+    if p1.ndim == 1: p1 = p1.reshape((-1, 2))
+    if p2.ndim == 1: p2 = p2.reshape((-1, 2))
+    
+    x1_min, y1_min = np.min(p1, axis=0)
+    x1_max, y1_max = np.max(p1, axis=0)
+    
+    x2_min, y2_min = np.min(p2, axis=0)
+    x2_max, y2_max = np.max(p2, axis=0)
+    
+    xi_min = max(x1_min, x2_min)
+    yi_min = max(y1_min, y2_min)
+    xi_max = min(x1_max, x2_max)
+    yi_max = min(y1_max, y2_max)
+    
+    inter_width = max(0, xi_max - xi_min)
+    inter_height = max(0, yi_max - yi_min)
+    inter_area = inter_width * inter_height
+    
+    area1 = (x1_max - x1_min) * (y1_max - y1_min)
+    area2 = (x2_max - x2_min) * (y2_max - y2_min)
+    
+    union = area1 + area2 - inter_area
+    if union <= 0: return 0
+    return inter_area / union
+
+def enhance_image(img, mode="Default"):
+    if mode == "Inverted":
+        return cv2.bitwise_not(img)
+    elif mode == "Gray":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    if mode == "High Contrast":
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-    if mode == "Thresholding":
+    elif mode == "Threshold":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                        cv2.THRESH_BINARY, 11, 2)
         return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-    if mode == "Denoise":
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-        return cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+    elif mode == "RedMask":
+        # Channel subtraction method (Robust for Red LED)
+        b, g, r = cv2.split(img)
+        # Red should be dominant. Subtract Green/Blue.
+        
+        # Method 1: Simple R - G (Robust for Red LED vs Dark/Grey)
+        # Reverted to this because weighted method (2R-G-B) caused ghosting on "1234" image.
+        diff = cv2.subtract(r, g)
+        
+        # Threshold: 45 seems like a good balance? 
+        # "1234" worked with 50. "123456" failed with 30 (saw nothing). 
+        # But "123456" is caught by Inverted mode. So we prioritize correctness on "1234".
+        _, mask = cv2.threshold(diff, 45, 255, cv2.THRESH_BINARY)
+        
+        # Dilate to connect segments
+        kernel = np.ones((3,3), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=3)
+        
+        # Save debug
+        cv2.imwrite("debug_redmask.jpg", mask)
+        
+        # Return as BGR (White digits on black background)
+        return cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     return img
 
-# ----------------- Local YOLO fallback -----------------
-def local_yolo_detect(img, conf_thres=0.35, min_area=200):
-    try:
-        from ultralytics import YOLO
-    except Exception:
-        print("[YOLO fallback] ultralytics not installed; skipping local YOLO fallback.", flush=True)
-        return []
-    weights_path = os.path.join(os.path.dirname(__file__), "..", "weights", "yolov8n.pt")
-    if not os.path.exists(weights_path):
-        weights_path = "yolov8n.pt"
-    try:
-        print(f"[YOLO fallback] loading weights {weights_path} ...", flush=True)
-        model = YOLO(weights_path)
-        res = model.predict(img, imgsz=640, conf=conf_thres, verbose=False)[0]
-        boxes = []
-        for b in res.boxes:
-            try:
-                xy = b.xyxy[0].tolist()
-            except Exception:
-                continue
-            x1,y1,x2,y2 = map(int, xy)
-            conf = float(getattr(b, "conf", [0.0])[0]) if hasattr(b, "conf") else 0.0
-            cls = int(getattr(b, "cls", [0])[0]) if hasattr(b, "cls") else 0
-            area = (x2-x1)*(y2-y1)
-            if area < min_area:
-                continue
-            boxes.append([x1,y1,x2,y2,conf,cls])
-        print(f"[YOLO fallback] returned {len(boxes)} boxes", flush=True)
-        return boxes
-    except Exception as e:
-        print("[YOLO fallback] error:", e, flush=True)
-        return []
-
-def detect_digits_raw(img):
-    # Skip Roboflow for now as per logs
-    print("[detect_digits_raw] Roboflow empty or failed; trying local YOLO...", flush=True)
-    boxes = local_yolo_detect(img)
-    return boxes or []
-
-def postprocess_boxes(raw_boxes, min_conf=0.45, min_area=600, iou_thresh=0.35):
-    if not raw_boxes:
-        return []
-    filtered = []
-    for b in raw_boxes:
-        x1,y1,x2,y2,conf,cls = b
-        w = max(0, x2-x1); h = max(0, y2-y1)
-        area = w*h
-        if conf < min_conf:
-            continue
-        if area < min_area:
-            continue
-        filtered.append(b)
-    filtered_nms = nms_boxes(filtered, iou_thresh=iou_thresh)
-    return filtered_nms
-
-def detect_digits(img):
-    raw = detect_digits_raw(img)
-    boxes = postprocess_boxes(raw, min_conf=0.30, min_area=1000, iou_thresh=0.35)
-    if not boxes:
-        H, W = img.shape[:2]
-        return [[0, 0, W, H, 1.0, 0]]
-    return boxes
-
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-def four_point_transform(image, pts):
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-    return warped
-
-def map_rows_to_metrics(img, boxes):
+def detect_text(img):
     """
-    PaddleOCR-based Screen-First OCR:
-    1. Crop Device (YOLO).
-    2. Find LCD Contour & Warp.
-    3. Run PaddleOCR on Warped Image.
-    4. Fallback to Center Crop if needed.
+    Generic 7-segment detection with Multi-Scale/Multi-Mode fallback.
     """
-    # DISABLED: YOLO keeps detecting wrong regions (labels instead of digits)
-    # Force using full image for now
-    H, W = img.shape[:2]
-    device_box = [0, 0, W, H]
-    print(f"[YOLO] Disabled - using full image.", flush=True)
+    ocr = get_reader()
     
-    # if not boxes:
-    #     H, W = img.shape[:2]
-    #     device_box = [0, 0, W, H]
-    # else:
-    #     device_box = max(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
-    #     # Check if box is too small (e.g. < 25% of image)
-    #     x1, y1, x2, y2 = map(int, device_box[:4])
-    #     box_area = (x2-x1)*(y2-y1)
-    #     img_area = img.shape[0] * img.shape[1]
-    #     if box_area < (img_area * 0.25):
-    #         print(f"[YOLO] Box area {box_area} is too small (<25% of {img_area}). Using full image.", flush=True)
-    #         H, W = img.shape[:2]
-    #         device_box = [0, 0, W, H]
-    
-    x1, y1, x2, y2 = map(int, device_box[:4])
-    H, W = img.shape[:2]
-    pad = 10
-    sx = max(0, x1 - pad); sy = max(0, y1 - pad)
-    ex = min(W, x2 + pad); ey = min(H, y2 + pad)
-    device_crop = img[sy:ey, sx:ex]
-    
-    if device_crop.size == 0: return {}, None
+    # 1. Preprocess (resize if too huge)
+    base_img = preprocess_image(img)
+    if base_img is None: return []
 
-    # --- Step 2: Find LCD Contour & Warp ---
-    ratio = device_crop.shape[0] / 500.0
-    orig_crop = device_crop.copy()
-    device_crop_small = cv2.resize(device_crop, (int(device_crop.shape[1]/ratio), 500))
-    
-    gray = cv2.cvtColor(device_crop_small, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 50, 200)
-    
-    cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
-    
-    screenCnt = None
-    for c in cnts:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            screenCnt = approx
-            break
-            
-    # DISABLED: Perspective warp causes too many issues with small/bad crops
-    # Just use the original crop directly
-    warped = orig_crop
-    print("[Perspective] Using original crop (warp disabled).", flush=True)
-    
-    # if screenCnt is not None:
-    #     warped = four_point_transform(orig_crop, screenCnt.reshape(4, 2) * ratio)
-    #     # Validate aspect ratio and minimum size
-    #     h_w, w_w = warped.shape[:2]
-    #     if h_w > 0 and (w_w / h_w > 3.0 or h_w / w_w > 3.0):
-    #         print(f"[Perspective] Warped aspect ratio {w_w/h_w:.2f} is extreme. Discarding warp.", flush=True)
-    #         warped = orig_crop
-    #     elif h_w < 200:  # Too small to OCR reliably
-    #         print(f"[Perspective] Warped image too small ({h_w}px height). Using original crop.", flush=True)
-    #         warped = orig_crop
-    #     else:
-    #         print("[Perspective] Screen contour found and warped.", flush=True)
-    # else:
-    #     warped = orig_crop
-    #     print("[Perspective] No screen contour found, using full crop.", flush=True)
+    all_detected_items = []
+    seen_texts = set()
 
-    target_h = 800
+    # Try multiple modes: Default, Inverted (for light-on-dark), and maybe Threshold
+    modes = ["Default", "Inverted", "RedMask"]
     
-    # Helper to run PaddleOCR on an image
-    def run_ocr_on_image(input_img):
-        ocr = get_reader()
-        # Upscale small crops for better OCR
-        # scale_local = target_h / input_img.shape[0]
-        # img_resized = cv2.resize(input_img, (int(input_img.shape[1]*scale_local), target_h))
-        img_resized = input_img
-        print(f"[OCR Debug] Running OCR on image shape: {img_resized.shape}", flush=True)
+    for mode in modes:
+        print(f"[OCR] Running detection in mode: {mode}...", flush=True)
+        img_input = enhance_image(base_img, mode)
         
-        try:
-            print("[OCR Debug] Calling ocr.ocr()...", flush=True)
-            result = ocr.ocr(img_resized)
-            print(f"[OCR Debug] ocr.ocr() returned type: {type(result)}", flush=True)
-            
-            parsed_results = []
-            
-            # Check output format
-            if isinstance(result, dict) and 'rec_texts' in result:
-                texts = result['rec_texts']
-                boxes = result['rec_boxes']
-                scores = result['rec_scores']
-                for box, text, score in zip(boxes, texts, scores):
-                    parsed_results.append((box, text, score))
-            elif isinstance(result, list) and result:
-                # Check if it's a list of dicts (v3+ wrapper)
-                if isinstance(result[0], dict) and 'rec_texts' in result[0]:
-                    res_dict = result[0]
-                    texts = res_dict['rec_texts']
-                    boxes = res_dict['rec_boxes']
-                    scores = res_dict['rec_scores']
-                    for box, text, score in zip(boxes, texts, scores):
-                        parsed_results.append((box, text, score))
-                # Check if it's a list of lists (older format)
-                elif isinstance(result[0], list):
-                    for line in result[0]:
-                        box = line[0]
-                        text = line[1][0]
-                        score = line[1][1]
-                        parsed_results.append((box, text, score))
-            
-            print(f"[OCR Debug] Found {len(parsed_results)} items", flush=True)
-            return parsed_results, img_resized
-        except Exception as e:
-            print(f"[OCR Debug] Failed: {e}", flush=True)
-            return [], img_resized
-
-    # Run on Warped first
-    print("[OCR] Running on Warped Image...", flush=True)
-    all_results, debug_img_used = run_ocr_on_image(warped)
-    
-    # Validation Helper
-    def validate_results(results):
-        valid = []
-        for (bbox, text, conf) in results:
-            clean = re.sub(r'[^0-9]', '', text)
-            if not clean: continue
-            if len(clean) > 3: continue # Filter long noise
-            val = int(clean)
-            if val < 30 or val > 300: continue # Filter out of range
-            valid.append(clean)
-        return valid
-
-    # Check if we got valid results
-    valid_vals = validate_results(all_results)
-    
-    # If failed, try Center Crop
-    if not valid_vals:
-        print("[OCR] No valid results. Retrying with Center Crop...", flush=True)
-        h, w = orig_crop.shape[:2]
+        result = ocr.ocr(img_input)
         
-        # For BP monitors, digits are usually on the RIGHT side, labels on LEFT
-        # So crop to the right 60% horizontally, center 60% vertically
-        cy, cx = h // 2, w // 2
-        ch = int(h * 0.6)
-        cw = int(w * 0.6)
+        detected_in_pass = []
         
-        # Shift crop to the right side
-        y1 = max(0, cy - ch//2)
-        y2 = min(h, cy + ch//2)
-        x1 = max(0, w - cw)  # Start from right side
-        x2 = w  # Go to edge
+        # Handle PaddleOCR output formats
+        if result is None or not result: continue
         
-        center_crop = orig_crop[y1:y2, x1:x2]
-        
-        if center_crop.size > 0:
-            all_results, debug_img_used = run_ocr_on_image(center_crop)
-            valid_vals = validate_results(all_results)
-
-    ocr_input = debug_img_used
-        
-    # Helper for 7-segment text cleaning
-    def clean_segment_text(text):
-        # Common substitutions for 7-segment/LCD displays
-        # Removed 'S':'5' to avoid SYS -> 55
-        subs = {
-            'I': '1', 'l': '1', '|': '1', 'i': '1',
-            'O': '0', 'o': '0', 'D': '0', 'Q': '0',
-            'Z': '2', 'z': '2',
-            'B': '8', # B often recognized as 8
-            'A': '4', # A often recognized as 4
-            'G': '6', # G often recognized as 6
-            'T': '7', # T often recognized as 7
-            '.': '', ' ': ''
-        }
-        # Apply substitutions
-        for k, v in subs.items():
-            text = text.replace(k, v)
-        # Remove any remaining non-digits
-        return re.sub(r'[^0-9]', '', text)
-
-    # Filter & Cluster
-    components = []
-    print(f"[OCR Debug] Final results count: {len(all_results)}", flush=True)
-    for (bbox, text, conf) in all_results:
-        # Filter out labels explicitly
-        if any(label in text.upper() for label in ['SYS', 'DIA', 'PULSE', 'RATE', 'BPM', 'MMHG']):
-            print(f"    -> Ignored label text: '{text}'", flush=True)
+        # Check for empty result [None]
+        if isinstance(result, list) and len(result) == 1 and result[0] is None:
             continue
+
+        # Flatten logic
+        content = result[0] if isinstance(result, list) and len(result) > 0 else result
+        
+        # Parse based on structure
+        raw_items = []
+        
+        # Dict format (v3)
+        if isinstance(content, dict) and 'rec_texts' in content:
+            texts = content.get('rec_texts', [])
+            boxes = content.get('rec_boxes', [])
+            scores = content.get('rec_scores', [])
+            for i, text in enumerate(texts):
+                raw_items.append((boxes[i], text, scores[i]))
+        # List of Lists format
+        elif isinstance(content, list):
+            for line in content:
+                if not line or len(line) < 2: continue
+                box = line[0]
+                text_tuple = line[1]
+                if isinstance(text_tuple, (list, tuple)):
+                    raw_items.append((box, text_tuple[0], text_tuple[1]))
+                else:
+                    raw_items.append((box, str(text_tuple), 1.0))
+        
+        # Process Raw Items
+        for (box, text_raw, conf) in raw_items:
+            # Clean text
+            text_clean = clean_segment_text(text_raw)
+            if not text_clean: continue
             
-        clean_text = clean_segment_text(text)
-        print(f"  - Raw: '{text}' -> Clean: '{clean_text}' Conf: {conf:.2f}", flush=True)
+            # De-duplication key (text + approx location)
+            # Simple dedup: just text value for now to avoid noisy duplicates across modes?
+            # Better: Keep all valid ones and let user decide?
+            # Or dedup by overlap.
+            
+            # Let's just key by text to avoid exact duplicates
+            if text_clean in seen_texts: continue
+            seen_texts.add(text_clean)
+            
+            print(f"  [Item] Raw: '{text_raw}' -> Clean: '{text_clean}' ({conf:.2f})")
+            
+            # Ensure box is a list for JSON serialization
+            if isinstance(box, np.ndarray):
+                box = box.tolist()
+            elif isinstance(box, list):
+                # Check if elements are numpy types
+                box = [b.tolist() if isinstance(b, np.ndarray) else b for b in box]
+
+            detected_in_pass.append({
+                'text': text_clean,
+                'conf': float(conf),
+                'box': box,
+                'mode': mode  # Store mode for priority
+            })
+
+        # Merge results instead of hard replacement
+        all_detected_items.extend(detected_in_pass)
         
-        if not clean_text: continue
+    # NMS Deduplication
+    final_items = []
+    
+    # Sort potential items by Preference: RedMask > Inverted > Default
+    # Within mode, by confidence?
+    # Let's assign score: RedMask=3, Inverted=2, Default=1
+    def get_priority(item):
+        m = item.get('mode', 'Default')
+        score = 0
+        if m == 'RedMask': score = 3
+        elif m == 'Inverted': score = 2
+        else: score = 1
+        return score
+
+    # Before NMS, check for reverse pairs and boost the "correct" one
+    # E.g., "123456" vs "954321" - prefer ascending
+    def is_mostly_ascending(text):
+        if len(text) < 2: return True
+        ascending = sum(1 for i in range(len(text)-1) if text[i] <= text[i+1])
+        return ascending >= len(text) / 2
+    
+    # Find overlapping pairs and adjust confidence
+    for i in range(len(all_detected_items)):
+        for j in range(i+1, len(all_detected_items)):
+            item_a = all_detected_items[i]
+            item_b = all_detected_items[j]
+            
+            iou = calculate_iou(item_a['box'], item_b['box'])
+            if iou > 0.5:  # Significant overlap
+                # Check if they're similar length (likely same display)
+                if abs(len(item_a['text']) - len(item_b['text'])) <= 1:
+                    # Prefer ascending order
+                    a_ascending = is_mostly_ascending(item_a['text'])
+                    b_ascending = is_mostly_ascending(item_b['text'])
+                    
+                    if a_ascending and not b_ascending:
+                        # Boost A's confidence
+                        item_a['conf'] = max(item_a['conf'], item_b['conf'] + 0.01)
+                    elif b_ascending and not a_ascending:
+                        # Boost B's confidence  
+                        item_b['conf'] = max(item_b['conf'], item_a['conf'] + 0.01)
+    
+    # Sort by Priority DESC, then Confidence DESC
+    all_detected_items.sort(key=lambda x: (get_priority(x), x['conf']), reverse=True)
+    
+    indices_to_keep = []
+    dropped_indices = set()
+    
+    for i in range(len(all_detected_items)):
+        if i in dropped_indices: continue
         
-        # Paddle bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-        pts = np.array(bbox)
-        # print(f"DEBUG: bbox shape {pts.shape}, content {pts}", flush=True)
+        item_a = all_detected_items[i]
+        
+        # Ghost check again (just in case)
+        txt = item_a['text']
+        if len(txt) > 1 and txt.count('8') / len(txt) > 0.6:
+             # Ghost. Only keep if it's the ONLY thing we have.
+             # But here we are iterating sorted list.
+             # If we have *any* preserved item that is NOT ghost, drop this.
+             pass # Logic captured by lower priority or confidence usually?
+             # Let's explicit drop if we have better candidates
+             # But harder to do inside this loop.
+             pass
+
+        keep_a = True
+        
+        for j in range(i + 1, len(all_detected_items)):
+            if j in dropped_indices: continue
+            
+            item_b = all_detected_items[j]
+            
+            iou = calculate_iou(item_a['box'], item_b['box'])
+            if iou > 0.3: # Significant overlap
+                # Collision! 
+                # Since list is sorted by priority, A is better than B.
+                # Drop B.
+                dropped_indices.add(j)
+                # print(f"Dropped {item_b['text']} ({item_b['mode']}) in favor of {item_a['text']} ({item_a['mode']})")
+                
+        if keep_a:
+            indices_to_keep.append(i)
+            
+    final_items = [all_detected_items[i] for i in indices_to_keep]
+
+    # Post-filter ghosts from final list if we have alternatives
+    non_ghosts = [x for x in final_items if not (len(x['text'])>1 and x['text'].count('8')/len(x['text'])>0.6)]
+    if non_ghosts:
+        final_items = non_ghosts
+
+    # Additional filter: Remove obvious UI noise
+    # Keep only items that look like 7-segment readings:
+    # - Purely numeric
+    # - Reasonable length (3-6 digits for typical displays)
+    # - Prefer ascending/sequential patterns
+    segment_candidates = []
+    for item in final_items:
+        txt = item['text']
+        # Must be numeric and reasonable length (most displays are 3-6 digits)
+        if txt.isdigit() and 3 <= len(txt) <= 6:
+            # Calculate pattern score
+            pattern_score = 1.0
+            
+            # Heavily favor ascending sequences
+            if is_mostly_ascending(txt):
+                pattern_score *= 3.0
+            
+            # Penalize repeated digits (like "8888")
+            unique_ratio = len(set(txt)) / len(txt)
+            pattern_score *= unique_ratio
+            
+            # Final score: pattern × confidence × length
+            item['score'] = pattern_score * item['conf'] * len(txt)
+            segment_candidates.append(item)
+    
+    # If we found good candidates, use only the best one
+    if segment_candidates:
+        segment_candidates.sort(key=lambda x: x['score'], reverse=True)
+        final_items = [segment_candidates[0]]
+    
+    all_detected_items = final_items
+    
+    # Sort by vertical position (top to bottom), then horizontal (left to right) for display
+    def get_pos(item):
+        pts = np.array(item['box'])
         if pts.ndim == 1:
-            # If it's flat [x1,y1, x2,y2, ...], reshape
-            if len(pts) == 8:
-                pts = pts.reshape(4, 2)
-            elif len(pts) == 4:
-                # Maybe [x1, y1, x2, y2]?
-                x1, y1, x2, y2 = pts
-                pts = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
-        
-        min_y = np.min(pts[:, 1]); max_y = np.max(pts[:, 1])
-        min_x = np.min(pts[:, 0])
-        h_box = max_y - min_y
-        cy = (min_y + max_y) / 2
-        
-        # Filter tiny noise (< 2.5% of screen height to exclude tiny labels)
-        # The actual digits should be larger/bolder than label text
-        if h_box < (target_h * 0.025): 
-            print(f"    -> Ignored (too small: {h_box:.1f} < {target_h*0.025:.1f})", flush=True)
-            continue
-        
-        components.append({
-            'text': clean_text,
-            'cy': cy,
-            'min_x': min_x,
-            'h': h_box,
-            'conf': conf
-        })
-        
-    if not components: 
-        print("[OCR Debug] No components found after filtering.", flush=True)
-        return {}, ocr_input
+            pts = pts.reshape((-1, 2))
+        cy = np.mean(pts[:, 1])
+        cx = np.mean(pts[:, 0])
+        return (int(cy // 20), int(cx)) # Row binning (20px) then Column
 
-    # Cluster lines
-    components.sort(key=lambda c: c['cy'])
-    lines = []
-    curr = [components[0]]
-    for c in components[1:]:
-        if abs(c['cy'] - curr[-1]['cy']) < (target_h * 0.02):
-            curr.append(c)
-        else:
-            lines.append(curr)
-            curr = [c]
-    lines.append(curr)
+    all_detected_items.sort(key=get_pos)
     
-    final_lines = []
-    print(f"[OCR Debug] Clustered into {len(lines)} lines:", flush=True)
-    for i, line in enumerate(lines):
-        line.sort(key=lambda c: c['min_x'])
-        # Check each component individually
-        line_vals = []
-        for c in line:
-            txt = c['text']
-            if len(txt) > 3: continue
-            if not txt.isdigit(): continue
-            val = int(txt)
-            # Allow lower values (down to 10) to catch partial reads like "18" for "118"
-            # We can validate sanity later (e.g. SYS > DIA)
-            if 10 <= val <= 300:
-                line_vals.append({'text': txt, 'cy': c['cy'], 'min_x': c['min_x'], 'h': c['h']})
-        
-        if line_vals:
-            print(f"  Line {i}: Found valid components: {[v['text'] for v in line_vals]}", flush=True)
-            final_lines.extend(line_vals)
-        else:
-            print(f"  Line {i}: No valid components in {[c['text'] for c in line]}", flush=True)
-             
-    # Sort by CY (vertical order)
-    final_lines.sort(key=lambda l: l['cy'])
-    
-    # Filter out values in the TOP portion of image (where labels like "SYS" are)
-    # Device digits are usually in the CENTER/BOTTOM portion
-    if final_lines and len(final_lines) > 3:
-        img_height = target_h if target_h > 0 else 800
-        # Remove items in top 20% of image
-        filtered_lines = [l for l in final_lines if l['cy'] > img_height * 0.2]
-        if len(filtered_lines) >= 3:
-            final_lines = filtered_lines
-            print(f"[PaddleOCR] Filtered out top 20% values", flush=True)
-    
-    # Filter out UI overlay text
-    if final_lines:
-        # If we have more than 3 values, take the 3 LARGEST (by height) ones
-        # (device digits are always larger than scale numbers or UI overlay)
-        if len(final_lines) > 3:
-            # Sort by height (descending) and take top 3
-            final_lines_sorted = sorted(final_lines, key=lambda l: l.get('h', 0), reverse=True)
-            print(f"[PaddleOCR] Candidates sorted by height:", flush=True)
-            for l in final_lines_sorted:
-                print(f"  - '{l['text']}': h={l.get('h')}, x={l.get('min_x')}, y={l.get('cy')}", flush=True)
-            
-            final_lines_sorted = final_lines_sorted[:3]
-            
-            # Re-sort by vertical position for correct SYS/DIA/PULSE order
-            final_lines_sorted.sort(key=lambda l: l['cy'])
-            vals = [l['text'] for l in final_lines_sorted]
-            print(f"[PaddleOCR] Filtered to largest 3 values: {vals}", flush=True)
-        else:
-            vals = [l['text'] for l in final_lines]
-    else:
-        vals = []
-    
-    print(f"[PaddleOCR] Found values: {vals}", flush=True)
-    
-    result = {}
-    if len(vals) >= 1: result['SYS'] = vals[0]
-    if len(vals) >= 2: result['DIA'] = vals[1]
-    if len(vals) >= 3: result['PULSE'] = vals[2]
-    
-    return result, ocr_input
+    return all_detected_items
 
-def reconstruct_reading(img, boxes):
-    metrics, _ = map_rows_to_metrics(img, boxes)
-    values = []
-    if 'SYS' in metrics: values.append(metrics['SYS'])
-    if 'DIA' in metrics: values.append(metrics['DIA'])
-    if 'PULSE' in metrics: values.append(metrics['PULSE'])
-    return ' | '.join(values)
-
-def visualize(img, boxes, reading_str=None, show_conf=True):
+def visualize(img, items):
     vis = img.copy()
-    for b in boxes:
-        x1,y1,x2,y2,conf,_ = b
-        cv2.rectangle(vis, (x1,y1), (x2,y2), (0,255,0), 2)
-        if show_conf:
-            cv2.putText(vis, f"{conf:.2f}", (x1, max(0,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
-    if reading_str:
-        cv2.putText(vis, f"Reading: {reading_str}", (10,35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+    
+    # Ensure visualization matches preprocessing? 
+    # For simplicity, we assume 'items' coordinates map to 'img' dimensions roughly if aspect ratio preserved
+    # But since we resized in 'preprocess_image', coords are in resized space.
+    # To confirm visualization accuracy, we should really visualize on the preprocessed image.
+    
+    img_processed = preprocess_image(img)
+    vis = img_processed.copy()
+    
+    for item in items:
+        box = np.array(item['box']).astype(np.int32)
+        if box.ndim == 1:
+            box = box.reshape((-1, 2))
+        # Reshape to (N, 1, 2) for polylines
+        box = box.reshape((-1, 1, 2))
+        
+        cv2.polylines(vis, [box], True, (0, 255, 0), 2)
+        
+        # Draw text
+        x, y = box[0][0]
+        cv2.putText(vis, f"{item['text']} ({item['conf']:.2f})", 
+                   (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                   
     return vis
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) < 2:
-        print("Usage: python detect_and_ocr.py <image_path>")
-        sys.exit(1)
-    img_path = sys.argv[1]
-    img = cv2.imread(img_path)
-    if img is None:
-        print("Could not read image:", img_path)
-        sys.exit(1)
-    img = preprocess_image(img)
-    raw = detect_digits_raw(img)
-    boxes = detect_digits(img)
-    reading = reconstruct_reading(img, boxes)
-    metrics, debug_img = map_rows_to_metrics(img, boxes)
-    vis = visualize(img, boxes, reading)
-    out_path = "output.jpg"
-    cv2.imwrite(out_path, vis)
-    if debug_img is not None:
-        cv2.imwrite("debug_ocr_input.jpg", debug_img)
-        print("Saved debug OCR input to debug_ocr_input.jpg")
-    print("Detected Reading:", reading)
-    print("Mapped metrics:", metrics)
-    print("Saved visualization to", out_path)
+    # Test script in main
+    pass

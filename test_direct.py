@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Direct test of OCR without Streamlit caching issues"""
+"""Direct test for generic 7-segment OCR"""
 import sys
 import cv2
-from src.detect_and_ocr import preprocess_image, detect_digits, map_rows_to_metrics
+from src.detect_and_ocr import detect_text
 
 if len(sys.argv) < 2:
     print("Usage: python test_direct.py <image_path>")
@@ -17,16 +17,12 @@ if img is None:
 print(f"Testing image: {img_path}")
 print(f"Image shape: {img.shape}")
 
-# Preprocess
-img = preprocess_image(img)
-
 # Detect
-boxes = detect_digits(img)
-print(f"Detected {len(boxes)} boxes")
+items = detect_text(img)
 
-# OCR
-metrics, _ = map_rows_to_metrics(img, boxes)
-print(f"\n=== FINAL RESULT ===")
-print(f"SYS: {metrics.get('SYS', 'N/A')}")
-print(f"DIA: {metrics.get('DIA', 'N/A')}")
-print(f"PULSE: {metrics.get('PULSE', 'N/A')}")
+print(f"\n=== DETECTED ITEMS ===")
+for item in items:
+    print(f"Text: '{item['text']}' (Conf: {item['conf']:.2f})")
+
+if not items:
+    print("No items detected.")
