@@ -8,3 +8,4 @@ easyocr
 paddlepaddle
 paddleocr
 ultralytics
+google-generativeai

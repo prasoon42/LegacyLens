@@ -1,6 +1,21 @@
 # LegacyLens - 7-Segment OCR App
 
-LegacyLens is a web application designed to read numbers from 7-segment digital displays (like multimeters, digital clocks, and industrial meters).
+LegacyLens is a web application designed to read numbers from 7-segment digital displays (like multimeters, digital clocks, and industrial meters) **and interpret them using AI**.
+
+## 🚀 New: GenAI Integration
+LegacyLens now includes **OpenAI GPT-4** to:
+*   📊 **Interpret readings** with context and history
+*   ⚠️ **Detect anomalies** and provide alerts
+*   💬 **Answer questions** about your devices
+*   🤖 **Act as an AI assistant** for legacy equipment
+
+## 📸 New: Live Camera
+You can now use your webcam or phone camera directly!
+*   Click **"Live Camera"** in the app
+*   Point at the device
+*   Click **"Capture & Analyze"**
+
+See [OPENAI_SETUP.md](OPENAI_SETUP.md) for setup instructions.
 
 ## Supported Images
 This app is optimized for:
