@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import re
 from paddleocr import PaddleOCR
+import easyocr
 
 # ----------------- PaddleOCR SINGLETON -----------------
 _PADDLE_OCR = None
@@ -17,6 +18,17 @@ def get_reader():
         except Exception as e:
             raise RuntimeError("Install paddlepaddle and paddleocr properly. Error: "+str(e))
     return _PADDLE_OCR
+
+_EASY_OCR = None
+def get_easyocr_reader():
+    global _EASY_OCR
+    if _EASY_OCR is None:
+        try:
+            _EASY_OCR = easyocr.Reader(['en'])
+            print("[init] EasyOCR initialized.", flush=True)
+        except Exception as e:
+            print(f"Warning: EasyOCR init failed: {e}")
+    return _EASY_OCR
 
 # ----------------- PREPROCESS -----------------
 def preprocess_image(img, max_side=1200):
@@ -94,28 +106,39 @@ def enhance_image(img, mode="Default"):
                                        cv2.THRESH_BINARY, 11, 2)
         return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
     elif mode == "RedMask":
-        # Channel subtraction method (Robust for Red LED)
-        b, g, r = cv2.split(img)
-        # Red should be dominant. Subtract Green/Blue.
+        # HSV Masking for Red LED
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
-        # Method 1: Simple R - G (Robust for Red LED vs Dark/Grey)
-        # Reverted to this because weighted method (2R-G-B) caused ghosting on "1234" image.
-        diff = cv2.subtract(r, g)
+        # Red wraps around 0/180 in HSV
+        # Lower red range
+        lower_red1 = np.array([0, 50, 100])
+        upper_red1 = np.array([15, 255, 255])
         
-        # Threshold: 45 seems like a good balance? 
-        # "1234" worked with 50. "123456" failed with 30 (saw nothing). 
-        # But "123456" is caught by Inverted mode. So we prioritize correctness on "1234".
-        _, mask = cv2.threshold(diff, 45, 255, cv2.THRESH_BINARY)
+        # Upper red range
+        lower_red2 = np.array([165, 50, 100])
+        upper_red2 = np.array([180, 255, 255])
         
-        # Dilate to connect segments
-        kernel = np.ones((3,3), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=3)
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
         
-        # Save debug
-        cv2.imwrite("debug_redmask.jpg", mask)
+        mask = cv2.bitwise_or(mask1, mask2)
+        
+        # DILATE to thicken segments
+        kernel_dilate = np.ones((3,3), np.uint8)
+        mask = cv2.dilate(mask, kernel_dilate, iterations=1)
         
         # Return as BGR (White digits on black background)
-        return cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        # Add padding (black border)
+        mask_padded = cv2.copyMakeBorder(mask, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=0)
+        
+        # Resize to reasonable height for OCR (e.g. 100px)
+        h, w = mask_padded.shape[:2]
+        target_h = 100
+        scale = target_h / h
+        target_w = int(w * scale)
+        mask_resized = cv2.resize(mask_padded, (target_w, target_h))
+        
+        return cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
     return img
 
 def detect_text(img):
@@ -138,9 +161,30 @@ def detect_text(img):
         print(f"[OCR] Running detection in mode: {mode}...", flush=True)
         img_input = enhance_image(base_img, mode)
         
+        detected_in_pass = []
+        
         result = ocr.ocr(img_input)
         
-        detected_in_pass = []
+        # Fallback/Alternative: EasyOCR for RedMask if Paddle fails or just to augment
+        if mode == 'RedMask':
+             easy_reader = get_easyocr_reader()
+             if easy_reader:
+                 print(f"[OCR] Running EasyOCR on RedMask...", flush=True)
+                 easy_results = easy_reader.readtext(img_input)
+                 # Convert EasyOCR results to Paddle format for consistent processing
+                 # EasyOCR: ([[x,y]...], text, conf)
+                 for (bbox, text, conf) in easy_results:
+                     # EasyOCR bbox is list of 4 points
+                     # Paddle expects list of list of points?
+                     # We handle it in the loop below
+                     detected_in_pass.append({
+                        'text': clean_segment_text(text),
+                        'conf': float(conf),
+                        'box': bbox,
+                        'mode': mode + "_EasyOCR"
+                     })
+        
+        # detected_in_pass is already initialized
         
         # Handle PaddleOCR output formats
         if result is None or not result: continue
