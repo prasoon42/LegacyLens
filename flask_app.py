@@ -62,16 +62,22 @@ def analyze():
         # AI Interpretation
         ai_result = None
         if items:
-            # Combine all detected text for interpretation
-            # For now, take the highest confidence or first item
-            # In a real scenario, we might want to interpret specific fields
-            primary_reading = items[0]['text']
+            # Create a structured list of detected items with spatial context
+            # This helps the AI identify the "Main Instrument" based on size and position
+            structured_items = []
+            for item in items:
+                structured_items.append({
+                    'text': item['text'],
+                    'alternatives': item.get('alternatives', []),
+                    'center': item['spatial']['center'],
+                    'area': item['spatial']['area']
+                })
             
             # Get AI interpretation
             try:
                 ai_result = ai_interpreter.interpret_reading(
                     device_id='default_camera', 
-                    reading=primary_reading,
+                    reading=str(structured_items), # Pass as string representation
                     device_type='legacy_display'
                 )
             except Exception as e:
@@ -141,6 +147,34 @@ def ask():
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/update_config', methods=['POST'])
+def update_config():
+    """Update device configuration"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Missing config data'}), 400
+            
+        device_id = data.get('device_id', 'default_camera')
+        config = {
+            'name': data.get('name'),
+            'min_val': data.get('min_val'),
+            'max_val': data.get('max_val'),
+            'unit': data.get('unit')
+        }
+        
+        # Remove None values
+        config = {k: v for k, v in config.items() if v is not None}
+        
+        ai_interpreter.update_device_config(device_id, config)
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        print(f"Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':

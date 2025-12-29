@@ -9,3 +9,4 @@ paddlepaddle
 paddleocr
 ultralytics
 google-generativeai
+python-dotenv

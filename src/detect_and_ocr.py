@@ -31,7 +31,7 @@ def get_easyocr_reader():
     return _EASY_OCR
 
 # ----------------- PREPROCESS -----------------
-def preprocess_image(img, max_side=1200):
+def preprocess_image(img, max_side=1600):
     if img is None:
         return None
     h, w = img.shape[:2]
@@ -41,27 +41,25 @@ def preprocess_image(img, max_side=1200):
     return img
 
 def clean_segment_text(text):
-    # Map common 7-segment confusions
-    # 7-seg specific replacements
-    # Z -> 2, S -> 5, etc.
-    subs = {
-        'O': '0', 'o': '0', 'D': '0', 'Q': '0',
-        'Z': '2', 'z': '2',
-        'B': '8', 
-        'A': '4', 'h': '4',
-        'G': '6', 
-        'T': '7', 
-        'S': '5',
-        'E': '3', 'F': '3', # Common 7-seg confusions
-        '.': '', ' ': '',
-        ']': '1', '[': '1', 'l': '1', 'I': '1'
-    }
-    for k, v in subs.items():
-        text = text.replace(k, v)
+    # Filter to keep alphanumeric, dots, and basic symbols first
+    text = re.sub(r'[^a-zA-Z0-9.%°/.-]', '', text)
     
-    # Filter non-numeric? Or allow specific chars?
-    # For now, keep alphanumeric but focus on digits
-    return re.sub(r'[^0-9]', '', text)
+    # Only apply 7-segment substitutions if the string already contains a digit
+    # or if it's a very common misread pattern. This preserves units like "PSI".
+    if any(c.isdigit() for c in text) or len(text) <= 1:
+        subs = {
+            'O': '0', 'D': '0', 'U': '0',
+            'I': '1', 'L': '1', '|': '1',
+            'Z': '2',
+            'S': '5', 's': '5',
+            'G': '6', 'b': '6',
+            'B': '8',
+            'q': '9', 'g': '9'
+        }
+        for k, v in subs.items():
+            text = text.replace(k, v)
+    
+    return text
 
 def calculate_iou(box1, box2):
     # Simple fitting AABB IoU for robustness
@@ -100,6 +98,25 @@ def enhance_image(img, mode="Default"):
     elif mode == "Gray":
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    elif mode == "Contrast":
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl,a,b))
+        return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    elif mode == "Denoised":
+        return cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+    elif mode == "Binarized":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Denoise before binarization
+        gray = cv2.medianBlur(gray, 3)
+        bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        return cv2.cvtColor(bin_img, cv2.COLOR_GRAY2BGR)
+    elif mode == "Sharpened":
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        return cv2.filter2D(img, -1, kernel)
     elif mode == "Threshold":
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
@@ -139,6 +156,30 @@ def enhance_image(img, mode="Default"):
         mask_resized = cv2.resize(mask_padded, (target_w, target_h))
         
         return cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
+    elif mode == "AmberMask":
+        # HSV Masking for Yellow/Orange LED
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # Amber/Yellow/Orange range
+        lower_amber = np.array([10, 50, 100])
+        upper_amber = np.array([45, 255, 255])
+        
+        mask = cv2.inRange(hsv, lower_amber, upper_amber)
+        
+        # DILATE to thicken segments
+        kernel_dilate = np.ones((3,3), np.uint8)
+        mask = cv2.dilate(mask, kernel_dilate, iterations=1)
+        
+        # Return as BGR (White digits on black background)
+        mask_padded = cv2.copyMakeBorder(mask, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=0)
+        
+        h, w = mask_padded.shape[:2]
+        target_h = 100
+        scale = target_h / h
+        target_w = int(w * scale)
+        mask_resized = cv2.resize(mask_padded, (target_w, target_h))
+        
+        return cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
     return img
 
 def detect_text(img):
@@ -154,8 +195,8 @@ def detect_text(img):
     all_detected_items = []
     seen_texts = set()
 
-    # Try multiple modes: Default, Inverted (for light-on-dark), and maybe Threshold
-    modes = ["Default", "Inverted", "RedMask"]
+    # Try multiple modes for maximum accuracy
+    modes = ["Default", "Inverted", "RedMask", "AmberMask", "Contrast", "Binarized", "Sharpened", "Denoised"]
     
     for mode in modes:
         print(f"[OCR] Running detection in mode: {mode}...", flush=True)
@@ -165,11 +206,11 @@ def detect_text(img):
         
         result = ocr.ocr(img_input)
         
-        # Fallback/Alternative: EasyOCR for RedMask if Paddle fails or just to augment
-        if mode == 'RedMask':
+        # Fallback/Alternative: EasyOCR for Red/AmberMask if Paddle fails or just to augment
+        if mode in ['RedMask', 'AmberMask']:
              easy_reader = get_easyocr_reader()
              if easy_reader:
-                 print(f"[OCR] Running EasyOCR on RedMask...", flush=True)
+                 print(f"[OCR] Running EasyOCR on {mode}...", flush=True)
                  easy_results = easy_reader.readtext(img_input)
                  # Convert EasyOCR results to Paddle format for consistent processing
                  # EasyOCR: ([[x,y]...], text, conf)
@@ -212,8 +253,10 @@ def detect_text(img):
                 if not line or len(line) < 2: continue
                 box = line[0]
                 text_tuple = line[1]
-                if isinstance(text_tuple, (list, tuple)):
+                if isinstance(text_tuple, (list, tuple)) and len(text_tuple) >= 2:
                     raw_items.append((box, text_tuple[0], text_tuple[1]))
+                elif isinstance(text_tuple, (list, tuple)) and len(text_tuple) == 1:
+                    raw_items.append((box, text_tuple[0], 1.0))
                 else:
                     raw_items.append((box, str(text_tuple), 1.0))
         
@@ -260,17 +303,13 @@ def detect_text(img):
     def get_priority(item):
         m = item.get('mode', 'Default')
         score = 0
-        if m == 'RedMask': score = 3
+        if m == 'RedMask': score = 4
+        elif m == 'AmberMask': score = 3
         elif m == 'Inverted': score = 2
         else: score = 1
         return score
 
-    # Before NMS, check for reverse pairs and boost the "correct" one
-    # E.g., "123456" vs "954321" - prefer ascending
-    def is_mostly_ascending(text):
-        if len(text) < 2: return True
-        ascending = sum(1 for i in range(len(text)-1) if text[i] <= text[i+1])
-        return ascending >= len(text) / 2
+    # Removed is_mostly_ascending heuristic as it's too restrictive for general use
     
     # Find overlapping pairs and adjust confidence
     for i in range(len(all_detected_items)):
@@ -279,19 +318,11 @@ def detect_text(img):
             item_b = all_detected_items[j]
             
             iou = calculate_iou(item_a['box'], item_b['box'])
+            # Overlap check remains, but without ascending boost
             if iou > 0.5:  # Significant overlap
-                # Check if they're similar length (likely same display)
-                if abs(len(item_a['text']) - len(item_b['text'])) <= 1:
-                    # Prefer ascending order
-                    a_ascending = is_mostly_ascending(item_a['text'])
-                    b_ascending = is_mostly_ascending(item_b['text'])
-                    
-                    if a_ascending and not b_ascending:
-                        # Boost A's confidence
-                        item_a['conf'] = max(item_a['conf'], item_b['conf'] + 0.01)
-                    elif b_ascending and not a_ascending:
-                        # Boost B's confidence  
-                        item_b['conf'] = max(item_b['conf'], item_a['conf'] + 0.01)
+                # Just keep the one with higher confidence
+                if item_a['conf'] < item_b['conf']:
+                    item_a['conf'] = item_b['conf'] # Placeholder for sorting
     
     # Sort by Priority DESC, then Confidence DESC
     all_detected_items.sort(key=lambda x: (get_priority(x), x['conf']), reverse=True)
@@ -323,12 +354,17 @@ def detect_text(img):
             item_b = all_detected_items[j]
             
             iou = calculate_iou(item_a['box'], item_b['box'])
-            if iou > 0.3: # Significant overlap
+            if iou > 0.4: # Significant overlap
                 # Collision! 
-                # Since list is sorted by priority, A is better than B.
-                # Drop B.
+                # Instead of dropping, let's add it as an alternative if the text is different
+                if item_a['text'] != item_b['text']:
+                    if 'alternatives' not in item_a:
+                        item_a['alternatives'] = []
+                    if item_b['text'] not in item_a['alternatives']:
+                        item_a['alternatives'].append(item_b['text'])
+                
+                # Still drop B from the main list so we don't have duplicate boxes
                 dropped_indices.add(j)
-                # print(f"Dropped {item_b['text']} ({item_b['mode']}) in favor of {item_a['text']} ({item_a['mode']})")
                 
         if keep_a:
             indices_to_keep.append(i)
@@ -340,35 +376,36 @@ def detect_text(img):
     if non_ghosts:
         final_items = non_ghosts
 
-    # Additional filter: Remove obvious UI noise
-    # Keep only items that look like 7-segment readings:
-    # - Purely numeric
-    # - Reasonable length (3-6 digits for typical displays)
-    # - Prefer ascending/sequential patterns
-    segment_candidates = []
+    # Keep all items that have reasonable confidence and aren't just noise
+    diverse_items = []
     for item in final_items:
         txt = item['text']
-        # Must be numeric and reasonable length (most displays are 3-6 digits)
-        if txt.isdigit() and 3 <= len(txt) <= 6:
-            # Calculate pattern score
-            pattern_score = 1.0
-            
-            # Heavily favor ascending sequences
-            if is_mostly_ascending(txt):
-                pattern_score *= 3.0
-            
-            # Penalize repeated digits (like "8888")
-            unique_ratio = len(set(txt)) / len(txt)
-            pattern_score *= unique_ratio
-            
-            # Final score: pattern × confidence × length
-            item['score'] = pattern_score * item['conf'] * len(txt)
-            segment_candidates.append(item)
+        # Keep if it has at least one alphanumeric char and isn't too short unless it's a known unit
+        if len(txt) >= 1 and any(c.isalnum() for c in txt):
+            diverse_items.append(item)
+    if diverse_items:
+        final_items = diverse_items
     
-    # If we found good candidates, use only the best one
-    if segment_candidates:
-        segment_candidates.sort(key=lambda x: x['score'], reverse=True)
-        final_items = [segment_candidates[0]]
+    # Add spatial context (normalized coordinates and size)
+    h, w = base_img.shape[:2]
+    for item in final_items:
+        pts = np.array(item['box'])
+        if pts.ndim == 1:
+            pts = pts.reshape((-1, 2))
+            
+        xmin, xmax = np.min(pts[:, 0]), np.max(pts[:, 0])
+        ymin, ymax = np.min(pts[:, 1]), np.max(pts[:, 1])
+        
+        center_x = (xmin + xmax) / 2 / w
+        center_y = (ymin + ymax) / 2 / h
+        width = (xmax - xmin) / w
+        height = (ymax - ymin) / h
+        
+        item['spatial'] = {
+            'center': [round(center_x, 3), round(center_y, 3)],
+            'size': [round(width, 3), round(height, 3)],
+            'area': round(width * height, 4)
+        }
     
     all_detected_items = final_items
     
